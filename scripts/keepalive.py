@@ -12,7 +12,53 @@ def log(msg):
     print(datetime.now(timezone.utc).strftime("%H:%M:%S UTC"), msg, flush=True)
 
 TAB_SEL = 'button[role="tab"]'
+APP_SEL = '[data-testid="stApp"]'
 WAKE_TEXTS = ("Yes, get this app back up", "get this app back up")
+
+from urllib.parse import urlparse
+
+_EVENTS = {"console": [], "failed": [], "ws": []}
+
+def _hook_events(page):
+    """Collect a few safe diagnostics (no URLs with hostnames, no page data)."""
+    def on_console(m):
+        try:
+            if m.type == "error" and len(_EVENTS["console"]) < 5:
+                _EVENTS["console"].append(m.text[:110])
+        except Exception:
+            pass
+    def on_failed(r):
+        try:
+            if len(_EVENTS["failed"]) < 5:
+                _EVENTS["failed"].append(f"{r.resource_type}:{urlparse(r.url).path[:50]}")
+        except Exception:
+            pass
+    def on_ws(w):
+        try:
+            _EVENTS["ws"].append("open:" + urlparse(w.url).path[:40])
+            w.on("close", lambda *_: _EVENTS["ws"].append("closed:" + urlparse(w.url).path[:40]))
+        except Exception:
+            pass
+    page.on("console", on_console)
+    page.on("requestfailed", on_failed)
+    page.on("websocket", on_ws)
+
+def diag(page):
+    try:
+        log(f"diag: title={page.title()[:60]!r}")
+    except Exception:
+        pass
+    for i, fr in enumerate(_frames(page)):
+        try:
+            path = urlparse(fr.url).path[:40] or "/"
+            info = fr.evaluate(
+                "()=>({rs:document.readyState,n:document.body?document.body.innerText.length:-1,"
+                "t:(document.body?document.body.innerText:'').replace(/\\s+/g,' ').slice(0,90)})")
+            log(f"diag: frame{i} path={path} ready={info['rs']} textlen={info['n']} "
+                f"stApp={fr.locator(APP_SEL).count()} text={info['t']!r}")
+        except Exception as e:
+            log(f"diag: frame{i} error {type(e).__name__}")
+    log(f"diag: ws={_EVENTS['ws'][-4:]} console={_EVENTS['console'][:3]} failed={_EVENTS['failed'][:3]}")
 
 def wake_if_sleeping(page):
     for t in WAKE_TEXTS:
@@ -65,7 +111,7 @@ def app_state(page):
         for t in WAKE_TEXTS:
             if _has_text(page, t):
                 return "asleep"
-        if _count(page, '[data-testid="stApp"]') >= 1:
+        if _count(page, APP_SEL) >= 1:
             return "partial"
     except Exception:
         pass
@@ -81,8 +127,13 @@ def main():
     log(f"keep-alive start: {a.minutes:.0f} min window")
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+        ctx = browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+            locale="en-US", timezone_id="Asia/Kolkata")
         page = ctx.new_page()
+        _hook_events(page)
         def open_app():
             try:
                 page.goto(a.url, wait_until="domcontentloaded", timeout=90000)
@@ -104,6 +155,8 @@ def main():
                 wake_if_sleeping(page); bad_streak = 0
             elif st in ("bad_message", "loading"):
                 bad_streak += 1
+                if bad_streak in (1, 3):
+                    diag(page)
                 # 'loading' is normal for the first ~60 s of a cold start
                 if st == "bad_message" or bad_streak >= 4:
                     log(f"{st} for {bad_streak} check(s) -> reloading page")
