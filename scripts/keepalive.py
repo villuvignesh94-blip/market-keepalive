@@ -11,6 +11,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 def log(msg):
     print(datetime.now(timezone.utc).strftime("%H:%M:%S UTC"), msg, flush=True)
 
+TAB_SEL = 'button[role="tab"]'
 WAKE_TEXTS = ("Yes, get this app back up", "get this app back up")
 
 def wake_if_sleeping(page):
@@ -25,16 +26,47 @@ def wake_if_sleeping(page):
             pass
     return False
 
-def app_state(page):
-    """returns 'ok' | 'bad_message' | 'loading' | 'asleep'"""
+def _frames(page):
+    """Streamlit Community Cloud renders the real app INSIDE an iframe, so
+    every check must look at the main page AND all child frames."""
     try:
-        if page.locator("text=Bad message format").count():
+        return list(page.frames)
+    except Exception:
+        return [page]
+
+def _count(page, selector):
+    n = 0
+    for fr in _frames(page):
+        try:
+            n = max(n, fr.locator(selector).count())
+        except Exception:
+            pass
+    return n
+
+def _has_text(page, text):
+    for fr in _frames(page):
+        try:
+            if fr.get_by_text(text, exact=False).count():
+                return True
+        except Exception:
+            pass
+    return False
+
+def app_state(page):
+    """returns 'ok' | 'partial' | 'bad_message' | 'loading' | 'asleep'
+    ok      = 13 main tabs visible (dashboard fully rendered)
+    partial = Streamlit app is running but tabs not all rendered (do not reload)
+    """
+    try:
+        if _has_text(page, "Bad message format"):
             return "bad_message"
-        if page.locator('button[role="tab"]').count() >= 13:
+        if _count(page, TAB_SEL) >= 13:
             return "ok"
         for t in WAKE_TEXTS:
-            if page.get_by_text(t, exact=False).count():
+            if _has_text(page, t):
                 return "asleep"
+        if _count(page, '[data-testid="stApp"]') >= 1:
+            return "partial"
     except Exception:
         pass
     return "loading"
@@ -66,7 +98,7 @@ def main():
             time.sleep(min(a.check_every, max(1, deadline - time.time())))
             st = app_state(page)
             if st != last_state:
-                log(f"state: {st}")
+                log(f"state: {st} (frames={len(_frames(page))}, tabs={_count(page, TAB_SEL)})")
                 last_state = st
             if st == "asleep":
                 wake_if_sleeping(page); bad_streak = 0
